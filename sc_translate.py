@@ -194,8 +194,16 @@ class Part:
             if lit:
                 out.append((name, lit))
                 self.notes.append(f'parameter {name}: expression "{i["node"].get("expr")}" unresolved - used the value')
+        self.literals = {}
+        for name, i in info.items():
+            lit = sc_literal(i['node'].get('value'))
+            if lit:
+                self.literals[name] = lit
         for name, expr in out:
-            self.cmds.append({'command': 'parameters.add', 'params': {'name': name, 'expression': expr}})
+            prm = {'name': name, 'expression': expr}
+            if info.get(name, {}).get('kind') == 'plain':
+                prm['unit'] = ''          # a count / ratio (Inventor "ul"), not a length
+            self.cmds.append({'command': 'parameters.add', 'params': prm})
         self.param_names = {n for n, _ in out}
         self.values = values
         return len(out)
@@ -824,7 +832,7 @@ DROPPABLE = ('sketch.dimension', 'sketch.constraint.', 'sketch.point', 'sketch.l
 STEP_ERR = re.compile(r'step (\d+) \(([\w.]+)\)')
 
 
-def run_script_robust(cmds, dest, keep=None, max_retries=80):
+def run_script_robust(cmds, dest, keep=None, max_retries=80, literals=None):
     """run_script, but a sketch constraint / dimension / entity SolidCraft refuses (for example
     one that would over-constrain the sketch) is dropped and the build re-run; anything else
     (a feature) still fails. Returns ok, errors, dropped[(command, reason)]."""
@@ -840,10 +848,20 @@ def run_script_robust(cmds, dest, keep=None, max_retries=80):
         if not m:
             return ok, errors, dropped, cmds
         n, name = int(m.group(1)), m.group(2)
-        idx = next((i for i in (n, n - 1) if 0 <= i < len(cmds) and cmds[i]['command'] == name), None)
+        # SolidCraft numbers steps from 1
+        idx = n - 1 if 0 <= n - 1 < len(cmds) and cmds[n - 1]['command'] == name else None
         if idx is None or not cmds[idx]['command'].startswith(DROPPABLE):
             return ok, errors, dropped, cmds
         reason = ' '.join(errors)[:200]
+        # a parameter expression SolidCraft's unit checking refuses (Inventor is lenient about
+        # mixing units): keep the parameter with its exact value instead of dropping it
+        if cmds[idx]['command'] == 'parameters.add' and literals:
+            prm = cmds[idx]['params']
+            lit = literals.get(prm.get('name'))
+            if lit and prm.get('expression') != lit:
+                dropped.append(('parameters.add', f"{prm['name']}: expression \"{prm['expression']}\" -> value {lit}", reason))
+                cmds[idx] = {'command': 'parameters.add', 'params': dict(prm, expression=lit)}
+                continue
         dropped.append((cmds[idx]['command'], json.dumps(cmds[idx]['params'])[:120], reason))
         del cmds[idx]
     return os.path.exists(dest), ['too many refused sketch commands'], dropped, cmds
@@ -888,7 +906,8 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
     # clean the parameter + sketch part once: drop what SolidCraft refuses (over-constraining
     # dimensions, unnamed parameters...), then reuse the cleaned commands for every build
     with tempfile.TemporaryDirectory() as td:
-        _, base_errs, dropped, cleaned = run_script_robust(param_cmds + sk_cmds, os.path.join(td, 'base.sc'))
+        _, base_errs, dropped, cleaned = run_script_robust(param_cmds + sk_cmds, os.path.join(td, 'base.sc'),
+                                                           literals=getattr(part, 'literals', None))
     n_param = sum(1 for c in cleaned if c['command'] == 'parameters.add')
     param_cmds, sk_cmds = cleaned[:n_param], cleaned[n_param:]
     rep['dropped_sketch_commands'] = len(dropped)
