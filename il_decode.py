@@ -253,16 +253,6 @@ try:
                 d['index'] = idx
                 seen[idx] = d
         nodes = [seen[k] for k in sorted(seen)]
-        dbg = os.environ.get('FC_DEBUG_IDX')
-        if dbg:
-            n = dc.elementNodes.get(int(dbg))
-            info = {'class': type(n).__name__, 'attrs': sorted(k for k in vars(n).keys())}
-            info['properties'] = {k: str(v)[:120] for k, v in (getattr(n, 'properties', {}) or {}).items()}
-            dn = getattr(n, 'node', None)
-            info['node_class'] = type(dn).__name__ if dn is not None else None
-            for k in ('name', 'typeName'):
-                info[k] = str(getattr(n, k, None))
-            status['debug_node'] = info
     type_counts = {}
     for n in nodes:
         type_counts[n.get('type')] = type_counts.get(n.get('type'), 0) + 1

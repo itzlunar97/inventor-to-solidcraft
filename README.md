@@ -18,17 +18,23 @@ For every part it recovers the parameters (with their real expressions), the 2D 
 | 1. Decode parts | `batch_decode.py` → `il_decode.py` | Runs the [InventorLoader](https://github.com/jmplonka/InventorLoader) readers headless inside FreeCAD's console and dumps every decoded node (parameters + formulas, sketches, features, profiles, edge sets) to JSON, plus the exact solid as STEP (ACIS → STEP). Parts missing from the live folders are recovered from the newest `OldVersions` backup. |
 | 2. Decode assemblies | `batch_decode.py --assemblies` | Dumps each `.iam`'s occurrence segment: component definitions, occurrence ids and 4×4 placements. |
 | 3. Translate parts | `batch_translate.py` → `sc_translate.py` | Writes a SolidCraft command script per part and runs it with `solidcraft-cli`, then verifies volume + bounding box against the exact solid. |
-| 4. Build assemblies | `sc_assembly.py` | Inserts each component's `.sc` as a linked component at the decoded matrix; sub-assemblies first. |
-| Progress | `progress_gui.py` | Retro green-phosphor progress window (watch a log, or run the whole pipeline). |
+| 2b. Recover references | `resolve_refs.py` + `batch_decode.py --extra` | Finds every file an assembly references (its `UFRxDoc` stream keeps the original paths) that the live folders lack, and decodes the newest `OldVersions` backup of each; repeat until nothing new appears. |
+| 4. Build assemblies | `sc_assembly.py` | Matches each component to its design (exact names, the assembly's own file references, browser names, occurrence counts), inserts it at the decoded matrix — linked when it has closed solids, otherwise its exact STEP/STL placed directly — sub-assemblies first; top-level assemblies are stood up (Inventor Y-up → SolidCraft Z-up). Saved as `<name>.iam.sc`. |
+| Hardware | `fasteners.py` | Content Center screws, nuts and washers that are not in the project are generated from their names (`ANSI B18.3.1M - M3x0.5 x 16`, `DIN 125 - A 3.2`, …) as parametric stand-ins. |
+| Progress | `progress_gui.py` + `chiptune.py` | Retro green-phosphor progress window: a spider crawls along its silk to the web as work completes, with an original 8-bit keygen-style soundtrack (toggle ♪, or `--no-music`). `--demo` shows it without a job. |
 | Quick look | `inv_extract.py` | Pure-Python parameter / feature-name / assembly-tree dump (no FreeCAD needed). |
 
 ### What becomes native
 
 * **Parameters** — every user and model parameter, in dependency order. An expression is kept only when it re-evaluates to the decoded value; otherwise the exact value is used (and the report says why).
 * **Sketches** — points, lines, circles, arcs, ellipses on their exact planes; coincident, horizontal/vertical, parallel, perpendicular, collinear, tangent, equal, symmetric and fixed constraints; distance, horizontal/vertical, radius, diameter, angle dimensions driven by the parameters. A constraint or dimension is only sent when the stored geometry already satisfies it, so sketches keep Inventor's exact shape.
-* **Features** — Extrude (new/join/cut/intersect, symmetric, two-sided, taper, through-all), Revolve, constant-radius Fillet and Chamfer. Fillet/chamfer edges are found by building the part up to that feature and classifying each edge midpoint against the exact final solid.
+* **Features** — Extrude (new/join/cut/intersect, symmetric, two-sided, taper, through-all), Revolve, Mirror, constant-radius Fillet and Chamfer. Fillet/chamfer edges are found by building the part up to that feature and classifying each edge midpoint against the exact final solid.
 
-Anything else (Hole, Mirror, patterns, Shell, Sweep, Loft, derived/reference bodies, …) currently keeps the exact solid + parameters + sketches.
+Anything else (Hole, patterns, Shell, Sweep, Loft, derived/reference bodies, …) currently keeps the exact solid + parameters + sketches. Imported bodies that arrive as open shells are closed with SolidCraft's `body.repair` where the gaps allow.
+
+### Speed
+
+Parts that cannot be rebuilt natively are written in a single SolidCraft run (parameters + sketches + exact solid); only native candidates are measured and verified. Every external call has a timeout, so one slow model never stops a batch.
 
 ### Result kinds (`translate_report.csv`)
 
@@ -57,8 +63,11 @@ pythonw progress_gui.py --run --project "C:\path\to\Inventor project" --work C:\
 # or stage by stage
 python batch_decode.py   "C:\path\to\Inventor project" C:\temp\inv-work
 python batch_decode.py   "C:\path\to\Inventor project" C:\temp\inv-work\asm --assemblies
+python resolve_refs.py   "C:\path\to\Inventor project" C:\temp\extra.csv C:\temp\inv-work\asm --skip C:\temp\inv-work\decode_report.csv
+python batch_decode.py   "C:\path\to\Inventor project" C:\temp\inv-extra --extra C:\temp\extra.csv
 python batch_translate.py C:\temp\inv-work "C:\path\to\SolidCraft Export" --project "C:\path\to\Inventor project"
-python sc_assembly.py     C:\temp\inv-work\asm "C:\path\to\SolidCraft Export"
+python batch_translate.py C:\temp\inv-extra "C:\path\to\SolidCraft Export\_recovered"
+python sc_assembly.py     "C:\temp\inv-work\asm;C:\temp\inv-extra" "C:\path\to\SolidCraft Export"
 
 # watch a running batch
 pythonw progress_gui.py --watch translate.log

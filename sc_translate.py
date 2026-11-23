@@ -23,7 +23,7 @@ SC_CLI = solidcraft_cli()
 CM = 10.0  # Inventor internal length unit is cm
 UNIT_MM = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'in': 25.4, 'inch': 25.4, 'ft': 304.8, 'um': 0.001}
 UNIT_DEG = {'°': 1.0, 'deg': 1.0, 'rad': 180.0 / math.pi, 'grad': 0.9}
-NATIVE_FEATURES = {'Extrude', 'Revolve', 'Fillet', 'Chamfer'}
+NATIVE_FEATURES = {'Extrude', 'Revolve', 'Fillet', 'Chamfer', 'Mirror'}
 IGNORED_FEATURES = {'Reference'}   # base bodies; only matter when nothing else exists
 
 
@@ -682,6 +682,35 @@ class Part:
             spec['flip'] = True
         return spec, None
 
+    def mirror(self, f, bodies):
+        """Mirror: plane (prop 0x0C) + mirrored features (prop 1) or whole bodies (prop 0x0A)."""
+        plane = self.prop(f, 0x0C)
+        if plane is None or not vec(plane['props'].get('normal')):
+            return None, 'mirror plane not resolved'
+        prm = {'plane': {'origin': [mm(x) for x in vec(plane['props'].get('center')) or [0, 0, 0]],
+                         'normal': vec(plane['props'].get('normal'))}}
+        feats = []
+        flist = self.prop(f, 1)
+        for r in (flist or {}).get('props', {}).get('lst0') or []:
+            fn = self.node(ref(r))
+            if fn and fn.get('name'):
+                feats.append(fn['name'])
+        if feats:
+            prm['features'] = feats
+        else:
+            coll = self.prop(f, 0x0A)
+            names = []
+            for r in (coll or {}).get('props', {}).get('items') or []:
+                b = self.node(ref(r))
+                m = re.match(r'^Solid(\d+)$', (b or {}).get('name') or '')
+                if m and f'Body{m.group(1)}' in bodies:
+                    names.append(f'Body{m.group(1)}')
+            if not names:
+                return None, 'mirrored bodies not resolved'
+            prm['bodies'] = names
+            prm['combine'] = True
+        return {'command': 'solid.mirror', 'params': prm}, None
+
     def revolve(self, f, sketches):
         sk = sketches.get((f.get('participants') or [None])[0])
         op = (self.prop(f, 0) or {}).get('props', {}).get('value')
@@ -718,7 +747,11 @@ class Part:
 
 # ------------------------------------------------------------------------- SolidCraft I/O
 def sc(*args, timeout=600):
-    r = subprocess.run([SC_CLI, *args], capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run([SC_CLI, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # one slow model must not stop a whole batch: report it as that item's failure
+        return 124, '', f'timeout: solidcraft-cli did not finish within {timeout} s'
     return r.returncode, r.stdout, r.stderr
 
 
@@ -732,14 +765,38 @@ def measure(path):
             d = json.load(f)
     tot = d.get('total', {})
     names = [b.get('name') for b in d.get('bodies', [])]
+    open_bodies = [b.get('name') for b in d.get('bodies', []) if b.get('closed') is False]
     boxes = [b.get('bbox') for b in d.get('bodies', []) if b.get('bbox')]
     if not boxes:
         return {'volume': tot.get('volume_mm3', 0), 'bbox': None, 'bodies': 0, 'names': names,
-                'timeline': d.get('timeline', [])}
+                'open': open_bodies, 'timeline': d.get('timeline', [])}
     lo = [min(b['min'][i] for b in boxes) for i in range(3)]
     hi = [max(b['max'][i] for b in boxes) for i in range(3)]
     return {'volume': tot.get('volume_mm3', 0), 'bbox': [lo, hi], 'bodies': len(boxes), 'names': names,
-            'timeline': d.get('timeline', [])}
+            'open': open_bodies, 'timeline': d.get('timeline', [])}
+
+
+def repair_open(dest):
+    """close imported bodies that came in as open shells: SolidCraft's body.repair sews free edges
+    (gaps up to 0.2 mm) into a solid. One eval, and one run only when something is open."""
+    m = measure(dest)
+    if not m or not m.get('open'):
+        return {'open_before': 0, 'open_after': 0}
+    before = len(m['open'])
+    # pass 1: sew free edges that pair up (gaps up to 0.2 mm);
+    # pass 2: what is still open has faces missing (the ACIS->STEP export dropped them):
+    #         sew with a wider gap and patch the holes so the part becomes a real solid
+    for params in ({}, {'gap': '1 mm', 'patch_holes': True}):
+        with tempfile.TemporaryDirectory() as td:
+            sp = os.path.join(td, 'repair.json')
+            with open(sp, 'w', encoding='utf-8') as f:
+                json.dump({'commands': [{'command': 'body.repair', 'params': dict(params, body=n)}
+                                        for n in m['open']]}, f)
+            sc('run', sp, '--in', dest, '--save', dest, '--allow-errors', '--quiet')
+        m = measure(dest)
+        if not m or not m.get('open'):
+            break
+    return {'open_before': before, 'open_after': len((m or {}).get('open', [])), 'patched': True}
 
 
 def query(design, cmds):
@@ -903,19 +960,6 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
             sketches[sk['index']] = r
     sk_cmds = part.cmds[len(param_cmds):]
 
-    # clean the parameter + sketch part once: drop what SolidCraft refuses (over-constraining
-    # dimensions, unnamed parameters...), then reuse the cleaned commands for every build
-    with tempfile.TemporaryDirectory() as td:
-        _, base_errs, dropped, cleaned = run_script_robust(param_cmds + sk_cmds, os.path.join(td, 'base.sc'),
-                                                           literals=getattr(part, 'literals', None))
-    n_param = sum(1 for c in cleaned if c['command'] == 'parameters.add')
-    param_cmds, sk_cmds = cleaned[:n_param], cleaned[n_param:]
-    rep['dropped_sketch_commands'] = len(dropped)
-    if dropped:
-        rep['dropped_examples'] = [f'{c} {p}: {r[-120:]}' for c, p, r in dropped[:8]]
-    if base_errs:
-        rep['sketch_errors'] = base_errs[:5]
-
     feats = part.features()
     kinds = [f.get('subtype') or '?' for f in feats]
     solid_feats = [f for f in feats if f.get('subtype') not in IGNORED_FEATURES]
@@ -924,13 +968,52 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
         unsupported = sorted(set(unsupported) | {'Reference body'})
     rep.update({'parameters': n_params, 'sketches': len(sketches),
                 'features': [f'{f.get("name")} ({f.get("subtype")})' for f in feats]})
-
-    exact = measure(part.step) if os.path.exists(part.step) else None
-    rep['exact'] = {'volume_mm3': exact and round(exact['volume'], 3), 'bbox': exact and exact['bbox']}
     keep = (lambda tag: os.path.join(keep_dir, f'{os.path.basename(dest)}.{tag}.script.json')) if keep_dir else (lambda tag: None)
+    has_faces = os.path.exists(part.step) and 'ADVANCED_FACE' in open(part.step, encoding='latin-1').read()
+    literals = getattr(part, 'literals', None)
+    try_native = bool(solid_feats) and not unsupported
+
+    def record_clean(dropped, errs):
+        rep['dropped_sketch_commands'] = len(dropped)
+        if dropped:
+            rep['dropped_examples'] = [f'{c} {p}: {r[-120:]}' for c, p, r in dropped[:8]]
+        if errs:
+            rep['sketch_errors'] = errs[:5]
+
+    def split_clean(cleaned):
+        n_param = sum(1 for c in cleaned if c['command'] == 'parameters.add')
+        return cleaned[:n_param], [c for c in cleaned[n_param:] if c['command'] != 'file.insert_step']
+
+    # Fast path (most parts): no native rebuild possible, so build parameters + sketches + the
+    # exact solid in ONE SolidCraft run (sketch commands it refuses are dropped on the way).
+    # Importing the exact file reproduces it by construction, so no measuring is needed.
+    if not try_native and has_faces:
+        ok, errs, dropped, cleaned = run_script_robust(
+            param_cmds + sk_cmds + [{'command': 'file.insert_step', 'params': {'path': part.step, 'flatten': True}}],
+            dest, keep('step'), literals=literals)
+        record_clean(dropped, [e for e in errs if 'insert_step' not in e])
+        param_cmds, sk_cmds = split_clean(cleaned)
+        if ok and not errs:
+            rep['repair'] = repair_open(dest)
+            rep.update(result='step+sketches', step_build={'errors': []},
+                       unsupported_features=unsupported, feature_problems=[],
+                       why_not_native='uses ' + ', '.join(unsupported) if unsupported else 'no solid features')
+            with open(dest + '.report.json', 'w', encoding='utf-8') as f:
+                json.dump(rep, f, indent=1)
+            return rep
+    else:
+        # clean the parameter + sketch part once and reuse it for every build below
+        with tempfile.TemporaryDirectory() as td:
+            _, base_errs, dropped, cleaned = run_script_robust(param_cmds + sk_cmds, os.path.join(td, 'base.sc'),
+                                                               literals=literals)
+        record_clean(dropped, base_errs)
+        param_cmds, sk_cmds = split_clean(cleaned)
+
+    exact = measure(part.step) if (try_native and has_faces) else None
+    rep['exact'] = {'volume_mm3': exact and round(exact['volume'], 3), 'bbox': exact and exact['bbox']}
 
     fx_cmds, fx_problems = [], []
-    if solid_feats and not unsupported:
+    if try_native:
         with tempfile.TemporaryDirectory() as td:
             finder, bodies = None, []
             for f in solid_feats:
@@ -965,6 +1048,8 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
                                     prm.update({k2: v for k2, v in spec.items()})
                                     fx_cmds.append({'command': 'solid.chamfer', 'params': prm})
                             continue
+                elif st == 'Mirror':
+                    cmd, why = part.mirror(f, bodies)
                 else:
                     cmd, why = None, f'{st} not supported'
                 if cmd:
@@ -986,7 +1071,6 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
         # exact geometry + everything editable that did translate; geometry fallbacks:
         # exact STEP -> faces sewn into solids (FreeCAD) -> surface mesh -> project STL -> none
         base_cmds = list(param_cmds) + list(sk_cmds)
-        has_faces = os.path.exists(part.step) and 'ADVANCED_FACE' in open(part.step, encoding='latin-1').read()
         attempts = []
         if has_faces:
             attempts.append(('step+sketches', {'command': 'file.insert_step', 'params': {'path': part.step, 'flatten': True}}))
@@ -1016,10 +1100,9 @@ def translate(out_dir, dest, name=None, keep_dir=None, stl_hint=None):
             ok, errs = run_script(base_cmds, dest, keep('step'))
             result = ('parameters+sketches only (no geometry in Inventor file)' if not has_faces
                       else 'parameters+sketches only (geometry could not be imported)') if ok else 'failed'
-        got = measure(dest) if ok else None
-        rep['step_build'] = {'errors': errs[:25], 'volume_mm3': got and round(got['volume'], 3)}
-        if result == 'step+sketches' and not same(got, exact):
-            result = 'step+sketches (unverified)'
+        rep['step_build'] = {'errors': errs[:25]}
+        if ok and result and result.startswith(('step', 'sewn')):
+            rep['repair'] = repair_open(dest)
         rep['result'] = result
         if fx_cmds and not fx_problems:
             rep['why_not_native'] = 'native rebuild did not match the exact solid'

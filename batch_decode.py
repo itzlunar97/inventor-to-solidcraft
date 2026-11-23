@@ -93,22 +93,30 @@ def main():
     ap.add_argument('--timeout', type=int, default=240)
     ap.add_argument('--only', default=None)
     ap.add_argument('--assemblies', action='store_true', help='decode the live .iam files instead of parts')
+    ap.add_argument('--extra', help='decode exactly the files in this CSV (source,file) - e.g. resolve_refs.py output')
     a = ap.parse_args()
     root = os.path.abspath(a.root)
-    if a.assemblies:
+    if a.assemblies or a.extra:
         jobs = []
-        for dp, dn, fn in os.walk(root):
-            if 'OldVersions' in dp.split(os.sep):
-                continue
-            jobs += [(os.path.join(dp, f), os.path.relpath(os.path.join(dp, f), root)) for f in fn if f.lower().endswith('.iam')]
+        if a.extra:
+            with open(a.extra, encoding='utf-8') as f:
+                jobs = [(r['source'], r['file']) for r in csv.DictReader(f)]
+        else:
+            for dp, dn, fn in os.walk(root):
+                if 'OldVersions' in dp.split(os.sep):
+                    continue
+                jobs += [(os.path.join(dp, f), os.path.relpath(os.path.join(dp, f), root)) for f in fn if f.lower().endswith('.iam')]
         jobs.sort(key=lambda j: j[1])
+        if not jobs:
+            print('nothing to decode')
+            return
         os.makedirs(a.work, exist_ok=True)
         rows = []
         with ThreadPoolExecutor(max_workers=a.jobs) as ex:
             futs = [ex.submit(run_one, src, rel, a.work, a.timeout, i) for i, (src, rel) in enumerate(jobs, 1)]
-            for fu in as_completed(futs):
+            for i, fu in enumerate(as_completed(futs), 1):
                 rows.append(fu.result())
-                print(f"{rows[-1]['stage']:<10} {rows[-1]['file']}", flush=True)
+                print(f"[{i}/{len(jobs)}] {rows[-1]['stage']:<10} {rows[-1]['seconds']:>6}s  {rows[-1]['file']}", flush=True)
         rows.sort(key=lambda r: r['file'])
         with open(os.path.join(a.work, 'decode_report.csv'), 'w', newline='', encoding='utf-8-sig') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))

@@ -74,7 +74,10 @@ def main():
     if a.project:
         index_stls(a.project)
     with open(os.path.join(a.work, 'decode_report.csv'), encoding='utf-8-sig') as f:
-        rows = [r for r in csv.DictReader(f) if r['stage'] == 'done']
+        rows = [r for r in csv.DictReader(f) if r['stage'] == 'done' and r['file'].lower().endswith('.ipt')]
+    if not rows:
+        print('no decoded parts in', a.work)
+        return
     if a.only:
         rows = [r for r in rows if a.only.lower() in r['file'].lower()]
     scripts = os.path.join(a.work, 'scripts')
