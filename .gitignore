@@ -1,0 +1,23 @@
+# generated / project data - never publish CAD or extracted design data
+output/
+work/
+*.sc
+*.step
+*.stp
+*.stl
+*.ipt
+*.iam
+*.ipj
+*.sat
+*.csv
+*.xlsx
+*.json
+!requirements*.json
+
+# older experiments and local notes
+fc_convert.py
+README_SFF_TOOLS.md
+
+__pycache__/
+*.pyc
+.vscode/
